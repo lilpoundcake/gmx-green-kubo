@@ -1,0 +1,23 @@
+# Conda / micromamba environment for gmx_gk_autocorr.
+#
+# Create with:
+#     micromamba create -f environment.yml
+# or
+#     conda env create -f environment.yml
+#
+# Activate, then install the CLI into it:
+#     micromamba activate green-kubo
+#     pip install .
+#
+# After installation, the `gmx-gk-autocorr` command is on $PATH.
+
+name: green-kubo
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.9
+  - numpy>=1.20
+  - scipy>=1.7
+  - plotly>=5.0
+  - python-kaleido>=0.2,<1.0  # enables `--plot-format png|svg`; <1.0 ships bundled chromium
+  - pip

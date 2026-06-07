@@ -1,0 +1,34 @@
+# Python / packaging artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Tool output artifacts that show up at the repo root after running the
+# example commands from the README. The actual user outputs always live
+# under -o <DIR> so these patterns only catch accidents at the project root.
+/acf.dat
+/acf.html
+/acf.png
+/acf.svg
+/viscosity.dat
+/viscosity.html
+/viscosity.png
+/viscosity.svg
+/metadata.dat
+/acf_mean.dat
+/acf_mean.html
+/viscosity_mean.dat
+/viscosity_mean.html
+/window_scan.dat
+/window_scan.html
+/viscosity_final.dat
+/viscosity_final.html
+/acf_fit.html
