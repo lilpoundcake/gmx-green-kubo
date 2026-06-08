@@ -184,6 +184,7 @@ gmx-gk-autocorr energy.xvg conf.gro
 |---|---|
 | `energy.xvg` | GROMACS `gmx energy` output. Required columns in order: time, Temperature, Pressure, Pres-XX, Pres-XY, Pres-XZ, Pres-YX, Pres-YY, Pres-YZ, Pres-ZX, Pres-ZY, Pres-ZZ. |
 | `conf.gro` | GROMACS structure file. Only the last line (cubic box edge, nm) is read. |
+| `--dt PS` | *(optional)* override the time axis: real per-frame step in ps. Use it when the xvg's first column shows frame indices instead of physical times (e.g. `0, 1, 2, …, 49999` instead of `0.000, 0.002, …, 99.998`). When set, the time array is rebuilt as `arange(N) * dt` and the file's column is ignored. |
 
 Outputs:
 
@@ -207,6 +208,7 @@ gmx-gk-autocorr acf XVG [XVG ...] [options]
 | `--volume V` | Volume in nm³ (overrides `--gro`). |
 | `--temperature T` | Temperature in K (auto-detected when the .xvg has a Temperature column). |
 | `--log-points N` | Log-spaced sample size for the output (default 10000). |
+| `--dt PS` | *(optional)* override the time axis: real per-frame step in ps. Useful when the xvg's first column is frame indices instead of physical times. Applied uniformly to all input xvgs. |
 
 With one input the outputs go into `-o` directly. With multiple inputs each
 trajectory is processed into its own subdirectory of `-o`, auto-named after
@@ -458,7 +460,7 @@ prefactor automatically — you rarely need to pass them on the command line:
 |---|---|---|
 | Volume V | last line of `--gro` (cubic box edge → V = edge³) | `--volume` |
 | Temperature T | Temperature column of a 12-column `energy.xvg` | `--temperature` |
-| Sample step dt | first two rows of the input data | (not user-tunable) |
+| Sample step dt | first two rows of the input data | `--dt` *(see below)* |
 | Zero-lag SACF C(0) | computed by `acf`, averaged by `average`, embedded in `acf_mean.dat` header | `--p0` |
 
 `scan` and `fit` read V, T and C(0) directly from `acf_mean.dat`'s metadata
@@ -470,6 +472,15 @@ after the first step.
 > analytical stretched-exponential fit, not the data. The default 0.001 ps
 > works for any liquid where the fitted relaxation time τ ≳ 0.01 ps;
 > decrease it if `fit` reports a sub-0.005 ps τ.
+
+> **Note on `--dt` (gk / acf only).** The tool normally reads the time
+> axis from the first column of the input `.xvg`. Some pipelines emit
+> frame indices (`0, 1, 2, …`) there instead of physical times, which
+> makes the resulting time axis (and the Green-Kubo prefactor) wrong by
+> the integration step. Pass `--dt PS` to rebuild the time axis as
+> `arange(N) * dt` and ignore the file's column. Example: a 50 000-frame
+> trajectory with a 0.002 ps integration step gets the correct 100 ps
+> total span via `--dt 0.002`.
 
 
 ## Example data

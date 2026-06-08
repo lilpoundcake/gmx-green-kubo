@@ -44,7 +44,19 @@ __version__ = "0.2.0"
 KB = 1.380649e-23  # Boltzmann constant in J/K
 
 
-def read_xvg(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _rebuild_time_axis(n: int, dt_ps: float) -> np.ndarray:
+    """Return an (N,) array of times in ps assuming uniform spacing ``dt_ps``.
+
+    Used by the --dt override: some xvg files report frame indices (0, 1,
+    2, …) instead of physical times. The fix is to ignore that column and
+    construct time = arange(N) * dt explicitly.
+    """
+    return np.arange(n, dtype=np.float64) * float(dt_ps)
+
+
+def read_xvg(
+    path: Path, dt_override_ps: float | None = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Read a GROMACS .xvg energy file produced by `gmx energy`.
 
     Returns
@@ -53,6 +65,11 @@ def read_xvg(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     temperature : (N,) array of temperatures in K
     pressure_tensor : (9, N) array with rows ordered
         Pxx, Pxy, Pxz, Pyx, Pyy, Pyz, Pzx, Pzy, Pzz (in bar)
+
+    If ``dt_override_ps`` is given, the time axis is reconstructed as
+    ``arange(N) * dt_override_ps`` and the file's time column is ignored.
+    Use this when the input xvg's first column is frame indices or in the
+    wrong units.
     """
     raw = np.loadtxt(path, comments=("@", "#"))
     if raw.ndim != 2 or raw.shape[1] < 12:
@@ -60,7 +77,10 @@ def read_xvg(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             f"{path}: expected at least 12 columns (time, T, P + 9 tensor components), "
             f"got shape {raw.shape}"
         )
-    time = raw[:, 0]
+    if dt_override_ps is not None:
+        time = _rebuild_time_axis(raw.shape[0], dt_override_ps)
+    else:
+        time = raw[:, 0]
     temperature = raw[:, 1]
     # raw[:, 2] is the total pressure column from gmx energy - not used here
     pressure_tensor = raw[:, 3:12].T  # shape (9, N): Pxx,Pxy,Pxz,Pyx,Pyy,Pyz,Pzx,Pzy,Pzz
@@ -307,6 +327,7 @@ HGK_CHANNEL_NAMES = ("pxy", "pxz", "pyz", "pyx", "pzx", "pzy")
 
 def read_pressure_components_xvg(
     path: Path,
+    dt_override_ps: float | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Read an .xvg file with off-diagonal pressure tensor components.
 
@@ -323,12 +344,20 @@ def read_pressure_components_xvg(
     time : (N,) array in ps
     channels : (6, N) array in bar, in order
         Pxy, Pxz, Pyz, Pyx, Pzx, Pzy.
+
+    If ``dt_override_ps`` is given, the time axis is reconstructed as
+    ``arange(N) * dt_override_ps`` and the file's time column is ignored.
+    Use this when the input xvg's first column is frame indices instead
+    of ps (e.g. column shows 0, 1, …, 49999 for a 50 000-step trajectory).
     """
     raw = np.loadtxt(path, comments=("@", "#"))
     if raw.ndim != 2:
         raise ValueError(f"{path}: failed to parse as a 2-D table (got shape {raw.shape})")
     n_cols = raw.shape[1]
-    time = raw[:, 0]
+    if dt_override_ps is not None:
+        time = _rebuild_time_axis(raw.shape[0], dt_override_ps)
+    else:
+        time = raw[:, 0]
     if n_cols >= 12:
         # legacy energy.xvg layout
         # columns: t, T, P, Pxx, Pxy, Pxz, Pyx, Pyy, Pyz, Pzx, Pzy, Pzz
@@ -751,6 +780,7 @@ def run_gk(
     gro_path: Path,
     output_dir: Path,
     output_prefix: str,
+    dt_override_ps: float | None = None,
     plot: bool = True,
     plot_points: int = 1500,
     plot_format: str = "html",
@@ -759,7 +789,12 @@ def run_gk(
     """Legacy gmx_gk_autocorr behaviour — byte-compatible with the C++ tool."""
     if verbose:
         print(f"Reading energy data from {xvg_path}")
-    time, temperature, pressure_tensor = read_xvg(xvg_path)
+        if dt_override_ps is not None:
+            print(
+                f"Overriding time axis: dt = {dt_override_ps} ps "
+                f"(input xvg's time column ignored)"
+            )
+    time, temperature, pressure_tensor = read_xvg(xvg_path, dt_override_ps=dt_override_ps)
     if time.size < 4:
         raise ValueError(
             f"{xvg_path}: need at least 4 frames to compute an autocorrelation, "
@@ -914,6 +949,7 @@ def _process_single_hgk_run(
     plot_points: int,
     plot_format: str,
     verbose: bool,
+    dt_override_ps: float | None = None,
 ) -> dict:
     """Run the per-trajectory hGK step on a single xvg file.
 
@@ -921,7 +957,14 @@ def _process_single_hgk_run(
     """
     if verbose:
         print(f"Reading pressure components from {xvg_path}")
-    time, channels = read_pressure_components_xvg(xvg_path)
+        if dt_override_ps is not None:
+            print(
+                f"Overriding time axis: dt = {dt_override_ps} ps "
+                f"(input xvg's time column ignored)"
+            )
+    time, channels = read_pressure_components_xvg(
+        xvg_path, dt_override_ps=dt_override_ps
+    )
     if time.size < 4:
         raise ValueError(f"{xvg_path}: need at least 4 frames, got {time.size}")
 
@@ -1011,6 +1054,7 @@ def run_hgk_run(
     plot_points: int = 1500,
     plot_format: str = "html",
     verbose: bool = False,
+    dt_override_ps: float | None = None,
 ) -> None:
     """Per-trajectory hGK step on one or more input xvg files.
 
@@ -1030,6 +1074,7 @@ def run_hgk_run(
             xvg_paths[0], output_dir, output_prefix,
             volume_arg, temperature_arg, gro_path,
             log_points, plot, plot_points, plot_format, verbose,
+            dt_override_ps=dt_override_ps,
         )
         return
 
@@ -1047,6 +1092,7 @@ def run_hgk_run(
             xvg_path, sub_out, output_prefix,
             volume_arg, temperature_arg, gro_path,
             log_points, plot, plot_points, plot_format, verbose,
+            dt_override_ps=dt_override_ps,
         )
     if verbose:
         print(
@@ -1564,6 +1610,15 @@ def build_parser() -> argparse.ArgumentParser:
         "gro", type=Path,
         help="GROMACS .gro structure file (only the last line, cubic box edge in nm, is read).",
     )
+    p_gk.add_argument(
+        "--dt", dest="dt_override_ps", type=float, default=None,
+        help=(
+            "Override the time axis: real per-frame step in ps. Use this "
+            "when the xvg's first column is frame indices (or in the wrong "
+            "units) — the time array is then rebuilt as arange(N) * dt and "
+            "the column is ignored."
+        ),
+    )
     _add_common_output_args(p_gk, default_prefix="")
 
     # acf ------------------------------------------------------------------
@@ -1599,6 +1654,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_acf.add_argument(
         "--log-points", type=int, default=10000,
         help="Approximate number of log-spaced points in the output (default: 10000).",
+    )
+    p_acf.add_argument(
+        "--dt", dest="dt_override_ps", type=float, default=None,
+        help=(
+            "Override the time axis: real per-frame step in ps. Use this "
+            "when the xvg's first column is frame indices (or in the wrong "
+            "units) — the time array is then rebuilt as arange(N) * dt and "
+            "the column is ignored."
+        ),
     )
     _add_common_output_args(p_acf, default_prefix="")
 
@@ -1725,6 +1789,7 @@ def main(argv: list[str] | None = None) -> int:
                 gro_path=args.gro,
                 output_dir=args.output_dir,
                 output_prefix=args.output_prefix,
+                dt_override_ps=args.dt_override_ps,
                 plot=args.plot,
                 plot_points=args.plot_points,
                 plot_format=args.plot_format,
@@ -1743,6 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
                 plot_points=args.plot_points,
                 plot_format=args.plot_format,
                 verbose=args.verbose,
+                dt_override_ps=args.dt_override_ps,
             )
         elif args.command == "average":
             run_hgk_avg(
