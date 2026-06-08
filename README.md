@@ -404,6 +404,125 @@ by less than ~0.1 %, you've converged.
   moves by less than a few %.
 
 
+## Sample-mean bias and `--subtract-mean`
+
+### The symptom
+
+`gk` and `acf` on the same trajectory give wildly different viscosities
+(e.g. **5 vs 14 mPa·s**, with the ratio close to 1:2). The per-channel
+viscosities printed by both tools are tens of mPa·s instead of the
+fraction-of-a-mPa·s expected for water-like liquids.
+
+This is not a bug in the algorithms — it's a finite-trajectory artifact
+of the input.
+
+### The cause
+
+Both algorithms estimate
+
+$$\eta(t) = \frac{V}{k_{\mathrm{B}}T} \int_0^{t} \big\langle P_{\alpha\beta}(0)\, P_{\alpha\beta}(t') \big\rangle\, dt'$$
+
+with the **raw** correlator $\langle P\,P \rangle$. The theoretical
+identity used to justify this is $\langle P_{\alpha\beta}\rangle_{\mathrm{eq}} = 0$
+for off-diagonal stress: at true equilibrium the off-diagonal pressure
+has zero mean, so $\langle P(0) P(t) \rangle = \mathrm{Cov}(P(0), P(t))$
+and the integral gives the viscosity.
+
+On a **finite trajectory**, that identity holds only approximately.
+Write $P = \mu + \delta P$ where $\mu$ is the sample mean and $\delta P$
+is the fluctuation:
+
+$$\big\langle P(0)P(t) \big\rangle_{\mathrm{sample}} \;=\; \mu^2 \;+\; \big\langle \delta P(0)\,\delta P(t) \big\rangle$$
+
+The $\mu^2$ floor is *constant* in $t$, so it integrates to a
+**linear-in-t bias** in the running viscosity:
+
+$$\eta_{\mathrm{bias}}(t) \;=\; \frac{V}{k_{\mathrm{B}}T}\, \mu^{2}\, t$$
+
+This is *not* viscosity — it's just a unit-bearing leftover from a
+non-vanishing sample mean. On any data where $\mu$ has not been
+sufficiently averaged to zero (short trajectories, non-equilibrium
+systems, systematic pressure-control artifacts), this bias dominates
+the result.
+
+| Algorithm | Integration window | Bias contribution |
+|---|---|---|
+| `gk` | t = N·dt/2 | $V\mu^2(N\cdot dt/2)/(k_{\mathrm{B}}T)$ |
+| `acf` (single-traj) | t = N·dt | twice the gk bias + tail noise |
+
+That ratio is exactly the 1:2 pattern in the 5-vs-14 symptom.
+
+### How to detect it
+
+Run with `-v`. The tool prints the sample mean, sample standard
+deviation, and approximate standard-of-mean for every channel, and
+emits a warning when the sample mean is more than 3 standard-of-means
+above zero:
+
+```
+Per-channel sample means (bar):
+  Pxy: mean = +0.9399  std =   39.92  std-of-mean ≈  0.1031  |mean|/sem ≈   9.1
+  Pxz: mean = +0.9389  std =   39.95  std-of-mean ≈  0.1031  |mean|/sem ≈   9.1
+  ...
+WARNING: channels {Pxy, Pxz, …} have sample means well above sampling
+noise. The Green-Kubo integral picks up a μ²·V·t/(kB·T) bias from each.
+Re-run with --subtract-mean …
+```
+
+The check uses a naïve $\sigma/\sqrt{N}$ estimator that ignores
+autocorrelation, so on short trajectories it is over-eager (it can fire
+even when the true mean is zero and the apparent mean is sampling
+noise). Use it as a prompt to inspect your data, not as a hard verdict.
+
+### The fix
+
+Pass `--subtract-mean` (available on `gk` and `acf`). With the flag,
+the autocorrelation is computed on $\delta P = P - \langle P \rangle$
+instead of $P$ — the fluctuation form that the
+fluctuation-dissipation theorem actually prescribes:
+
+```bash
+gmx-gk-autocorr acf my.xvg --gro conf.gro --temperature 303 \
+    --dt 0.002 --subtract-mean -o out/ -v
+```
+
+After this, the bias is gone:
+
+- $\eta_{\mathrm{computed}}(t) \approx \eta_{\mathrm{true}}$ (modulo
+  long-time noise)
+- `gk` and `acf` agree with each other to within tail-extrapolation
+  noise — that's the test that the fix worked
+- the residual scatter at long times is real statistical noise that
+  needs more trajectories or the hGK pipeline's tail extrapolation
+  (`scan` + `fit`)
+
+### Why it's not the default
+
+Two reasons:
+
+1. **Bit-exactness with the references we ported.** The original C++
+   `gmx_gk_autocorr` and the hGK reference Python scripts
+   (Meel & Mogurampelly) both use raw $\langle P\,P\rangle$. Keeping
+   the default identical preserves byte-for-byte reproducibility of
+   both:
+   - `gk` on `example_files/` ≡ C++ `SELFvisco.xvg` (`max abs diff = 0`)
+   - `acf+average+fit` on `spce_water/` ≡ hGK paper η = 0.6637 mPa·s
+2. **Short-trajectory bias trade-off.** On truly-zero-mean
+   well-equilibrated data, subtracting the noisy sample mean removes a
+   small amount of real signal (the low-frequency Fourier component
+   contaminated by sampling noise). For the bundled `spce_water/`
+   example (10 ps × 5 runs), the FDT-correct flag drops η from
+   0.6637 → 0.4168 mPa·s, the difference being mostly this
+   short-trajectory artifact rather than the bias.
+
+The right workflow is therefore: **run without the flag first**,
+inspect the verbose output, and turn the flag on if the diagnostic says
+your channel means are too big to be sampling noise. The published
+references (textbooks, Allen & Tildesley §4, Frenkel & Smit, FDT
+derivation) all agree that the fluctuation form is the strictly
+correct one.
+
+
 ## Config files (`@file`)
 
 Any argument can be loaded from a config file with argparse's `@file`
@@ -485,21 +604,13 @@ after the first step.
 > xvg's time column was the source of the previous "50k points labelled
 > as ps" bug.
 
-> **Note on `--subtract-mean` (gk / acf only).** By default the
-> autocorrelation is computed on the raw pressure-tensor signal — this
-> matches the original C++ gmx_gk_autocorr and the hGK reference Python
-> scripts, and relies on the theoretical identity ⟨P_αβ⟩\_eq = 0 for
-> off-diagonal stress. On finite trajectories with a non-zero sample
-> mean μ, the integrated Green-Kubo viscosity picks up a
-> μ²·V·t/(k_B·T) bias that grows **linearly** with the integration
-> window. Pass `--subtract-mean` (or use `-v` to see the per-channel
-> means and a warning when they look suspicious) to switch to the
-> fluctuation form δP = P − ⟨P⟩, which is what the
-> fluctuation-dissipation theorem actually prescribes and which removes
-> the bias. On the bundled `spce_water/` example the default reproduces
-> the hGK paper's η = 0.6637 mPa·s exactly; `--subtract-mean` gives
-> 0.4168 mPa·s. Differences > ~10 % between the two are a sign that the
-> bias matters for your data.
+> **Note on `--subtract-mean` (gk / acf only).** By default the ACF is
+> computed on the raw pressure-tensor signal, matching the original
+> C++ tool and the hGK reference. If `gk` and `acf` disagree by a
+> factor close to 2× on the same data, or if per-channel viscosities
+> are unreasonably large, the cause is almost certainly a non-zero
+> sample mean producing a linear-in-t bias. See **Sample-mean bias and
+> `--subtract-mean`** below for a full explanation and the fix.
 
 
 ## Example data
