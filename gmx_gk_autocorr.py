@@ -132,16 +132,68 @@ def symmetrize_pressure_tensor(pt: np.ndarray) -> np.ndarray:
     )
 
 
-def autocorrelation_fft(x: np.ndarray) -> np.ndarray:
-    """Circular autocorrelation via FFT (matches the original C++ implementation).
+def _check_sample_mean(
+    channels: np.ndarray,
+    names: Tuple[str, ...],
+    subtract_mean: bool,
+    verbose: bool,
+) -> None:
+    """Print per-channel sample means and warn about systematic bias.
 
-    Computes  c[k] = IDFT(|FFT(x)|**2 / N)[k]
-            = (1/N) * sum_j |X[j]|**2 exp(+2*pi*i*j*k/N) / N
-    which is the unbiased-by-zero-lag circular autocorrelation divided by N.
-    Equivalent to the FFTW-based pipeline in gkvisco.cpp's `m_do_wk`.
+    Each off-diagonal channel of the pressure tensor has ``<P_αβ>_eq = 0``
+    in theory, so a finite-sample mean larger than ``3 * σ/√N`` (where σ
+    is the sample standard deviation and N is the trajectory length) is
+    a sign that either the signal isn't equilibrated or the data has a
+    real systematic stress. Either way, the integrated Green-Kubo
+    viscosity picks up a ``μ²·V·t/(kB·T)`` linear-in-t bias that is *not*
+    physical viscosity. ``--subtract-mean`` removes it.
+    """
+    means = channels.mean(axis=1)
+    stds = channels.std(axis=1)
+    N = channels.shape[1]
+    sem = stds / np.sqrt(N)  # naive std-of-mean (treats samples as iid)
+    z = np.abs(means) / np.maximum(sem, 1e-30)
+    if verbose:
+        print("Per-channel sample means (bar):")
+        for name, m, s, e, zi in zip(names, means, stds, sem, z):
+            print(
+                f"  {name:>4}: mean = {m:+9.4f}  std = {s:8.2f}  "
+                f"std-of-mean ≈ {e:7.4f}  |mean|/sem ≈ {zi:6.1f}"
+            )
+    suspicious = (z > 3) & (np.abs(means) > 1e-3)
+    if suspicious.any() and not subtract_mean:
+        bad = ", ".join(n for n, b in zip(names, suspicious) if b)
+        print(
+            f"WARNING: channels {{{bad}}} have sample means well above "
+            f"sampling noise. The Green-Kubo integral picks up a "
+            f"μ²·V·t/(kB·T) bias from each. Re-run with --subtract-mean "
+            f"to use the fluctuation form δP = P − <P> (the FDT-correct "
+            f"convention). Without it, the result tracks the bias, not "
+            f"the physical viscosity."
+        )
+
+
+def autocorrelation_fft(x: np.ndarray, subtract_mean: bool = False) -> np.ndarray:
+    """Circular autocorrelation via FFT (matches the original C++ tool by default).
+
+    Computes  c[k] = IDFT(|FFT(x)|**2 / N)[k]  on the raw signal — i.e.
+    an estimator of the second moment ``<P(0)·P(t)>``, not the covariance
+    ``<δP(0)·δP(t)>``. This is the convention used by gkvisco.cpp's
+    ``m_do_wk`` and by every Green-Kubo Python tool surveyed (omidshy/aMD,
+    sergey-kruchinin/viscosity, argha1992/Viscosity_Green_Kubo), and it
+    relies on the theoretical identity ``<P_αβ>_eq = 0`` for off-diagonal
+    components.
+
+    On finite trajectories where the sample mean is significantly non-zero
+    (large enough that it can't be explained by sampling noise on a
+    true-zero-mean signal), the raw correlator picks up a bias of order
+    ``μ²·V·t/(kB·T)`` in the integrated viscosity. Pass
+    ``subtract_mean=True`` (CLI: ``--subtract-mean``) to switch to the
+    fluctuation form ``δx = x - mean(x)`` that eliminates this bias.
     """
     N = x.size
-    X = np.fft.fft(x)
+    arr = (x - x.mean()) if subtract_mean else x
+    X = np.fft.fft(arr)
     psd = (X.real * X.real + X.imag * X.imag) / N
     return np.fft.ifft(psd).real
 
@@ -378,22 +430,33 @@ def read_pressure_components_xvg(
     return time, channels
 
 
-def unbiased_autocorrelation_fft(x: np.ndarray) -> np.ndarray:
-    """Linear unbiased autocorrelation via zero-padded FFT.
+def unbiased_autocorrelation_fft(
+    x: np.ndarray, subtract_mean: bool = False
+) -> np.ndarray:
+    """Linear unbiased autocorrelation via zero-padded FFT (matches the hGK
+    reference by default).
 
-    Returns r[k] = (1/(N-k)) * sum_{j=0}^{N-1-k} x[j] x[j+k] for k = 0..N-1.
+    Returns  r[k] = (1/(N-k)) * sum_{j=0}^{N-1-k} x[j] x[j+k]  on the raw
+    signal — i.e. an estimator of ``<P(0)·P(t)>``, matching the SACF used
+    by Meel & Mogurampelly's gk_viscosity_fft.py. This relies on the
+    theoretical identity ``<P_αβ>_eq = 0`` for off-diagonal components.
 
-    This matches the SACF computed by hGK's gk_viscosity_fft.py:
-        ifft( fft(zero_pad(x)) * conj(...) )[:N] / arange(N, 0, -1)
+    Pass ``subtract_mean=True`` (CLI: ``--subtract-mean``) to switch to
+    the fluctuation form ``δx = x - mean(x)``, which is the form the
+    fluctuation-dissipation theorem actually prescribes and which removes
+    the linear-in-t bias that appears when the sample mean is
+    significantly non-zero (a real risk on short or non-equilibrated
+    trajectories).
     """
     n = x.size
+    arr = (x - x.mean()) if subtract_mean else x
     padded = np.zeros(2 * n, dtype=np.float64)
-    padded[:n] = x
+    padded[:n] = arr
     f = np.fft.fft(padded)
     acf_full = np.fft.ifft(f * np.conj(f)).real[:n]
-    # acf_full[k] equals sum_{j=0}^{N-1-k} x[j] x[j+k] exactly (zero-padding
-    # suppresses the wrap-around contribution); divide by (N - k) for the
-    # unbiased estimator.
+    # acf_full[k] equals sum_{j=0}^{N-1-k} arr[j] arr[j+k] exactly
+    # (zero-padding suppresses the wrap-around contribution); divide by
+    # (N - k) for the unbiased estimator.
     return acf_full / np.arange(n, 0, -1)
 
 
@@ -402,6 +465,7 @@ def hgk_compute_per_run(
     channels: np.ndarray,
     volume_nm3: float,
     temperature_K: float,
+    subtract_mean: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Compute the per-trajectory hGK SACF and running viscosity integral.
 
@@ -431,7 +495,10 @@ def hgk_compute_per_run(
     prefactor = dt_s * 1e-14 * volume_nm3 / (KB * temperature_K)
 
     sacf_per_channel = np.stack(
-        [unbiased_autocorrelation_fft(channels[i]) for i in range(channels.shape[0])]
+        [
+            unbiased_autocorrelation_fft(channels[i], subtract_mean=subtract_mean)
+            for i in range(channels.shape[0])
+        ]
     )
     sacf_avg = sacf_per_channel.mean(axis=0)
     poft0 = float(sacf_avg[0])
@@ -781,12 +848,20 @@ def run_gk(
     output_dir: Path,
     output_prefix: str,
     dt_override_ps: float | None = None,
+    subtract_mean: bool = False,
     plot: bool = True,
     plot_points: int = 1500,
     plot_format: str = "html",
     verbose: bool = False,
 ) -> None:
-    """Legacy gmx_gk_autocorr behaviour — byte-compatible with the C++ tool."""
+    """Classical Green-Kubo from one trajectory.
+
+    Bit-exact with the original C++ gmx_gk_autocorr by default. Pass
+    ``subtract_mean=True`` (CLI: ``--subtract-mean``) to switch to the
+    FDT-correct fluctuation form, which removes a μ²·V·t/(kB·T) bias
+    that contaminates the integral when the off-diagonal stress has a
+    sample mean significantly above sampling noise.
+    """
     if verbose:
         print(f"Reading energy data from {xvg_path}")
         if dt_override_ps is not None:
@@ -816,10 +891,22 @@ def run_gk(
 
     sym = symmetrize_pressure_tensor(pressure_tensor)
     N = sym.shape[1]
+    _check_sample_mean(
+        sym,
+        names=("XY+YX", "XZ+ZX", "YZ+ZY", "XX-YY", "XX-ZZ", "YY-ZZ"),
+        subtract_mean=subtract_mean,
+        verbose=verbose,
+    )
 
     if verbose:
-        print(f"Computing autocorrelations via FFT (N = {N})")
-    autocorr = np.stack([autocorrelation_fft(sym[i]) for i in range(sym.shape[0])])
+        print(
+            f"Computing autocorrelations via FFT (N = {N})"
+            f"{' on δP = P − <P>' if subtract_mean else ''}"
+        )
+    autocorr = np.stack(
+        [autocorrelation_fft(sym[i], subtract_mean=subtract_mean)
+         for i in range(sym.shape[0])]
+    )
 
     half_len = N // 2
     factor = volume * 1e-26 / (KB * temperature_avg) * dt
@@ -950,6 +1037,7 @@ def _process_single_hgk_run(
     plot_format: str,
     verbose: bool,
     dt_override_ps: float | None = None,
+    subtract_mean: bool = False,
 ) -> dict:
     """Run the per-trajectory hGK step on a single xvg file.
 
@@ -976,10 +1064,20 @@ def _process_single_hgk_run(
     if verbose:
         print(f"Frames: {time.size}  dt = {dt} ps")
         print(f"Volume: {volume} nm^3  Temperature: {temperature} K")
-        print("Computing unbiased SACF via zero-padded FFT for 6 channels")
+    _check_sample_mean(
+        channels,
+        names=("Pxy", "Pxz", "Pyz", "Pyx", "Pzx", "Pzy"),
+        subtract_mean=subtract_mean,
+        verbose=verbose,
+    )
+    if verbose:
+        print(
+            "Computing unbiased SACF via zero-padded FFT for 6 channels"
+            f"{' on δP = P − <P>' if subtract_mean else ''}"
+        )
 
     sacf_per_channel, sacf_avg, poft0, eta_per_channel = hgk_compute_per_run(
-        time, channels, volume, temperature
+        time, channels, volume, temperature, subtract_mean=subtract_mean
     )
     eta_avg = eta_per_channel.mean(axis=0)
 
@@ -1055,6 +1153,7 @@ def run_hgk_run(
     plot_format: str = "html",
     verbose: bool = False,
     dt_override_ps: float | None = None,
+    subtract_mean: bool = False,
 ) -> None:
     """Per-trajectory hGK step on one or more input xvg files.
 
@@ -1075,6 +1174,7 @@ def run_hgk_run(
             volume_arg, temperature_arg, gro_path,
             log_points, plot, plot_points, plot_format, verbose,
             dt_override_ps=dt_override_ps,
+            subtract_mean=subtract_mean,
         )
         return
 
@@ -1093,6 +1193,7 @@ def run_hgk_run(
             volume_arg, temperature_arg, gro_path,
             log_points, plot, plot_points, plot_format, verbose,
             dt_override_ps=dt_override_ps,
+            subtract_mean=subtract_mean,
         )
     if verbose:
         print(
@@ -1619,6 +1720,16 @@ def build_parser() -> argparse.ArgumentParser:
             "matching the integration step of your MD setup."
         ),
     )
+    p_gk.add_argument(
+        "--subtract-mean", dest="subtract_mean", action="store_true",
+        help=(
+            "Subtract the sample mean from each channel before computing the "
+            "autocorrelation, i.e. compute <δP(0)·δP(t)> instead of "
+            "<P(0)·P(t)>. The FDT-correct convention. Off by default (matches "
+            "the original C++ tool); turn on if the verbose diagnostic reports "
+            "channel means significantly above sampling noise."
+        ),
+    )
     _add_common_output_args(p_gk, default_prefix="")
 
     # acf ------------------------------------------------------------------
@@ -1662,6 +1773,16 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: 0.002). The time array is computed as arange(N) * dt "
             "and the input xvg's first column is ignored. Pass the value "
             "matching the integration step of your MD setup."
+        ),
+    )
+    p_acf.add_argument(
+        "--subtract-mean", dest="subtract_mean", action="store_true",
+        help=(
+            "Subtract the sample mean from each channel before computing the "
+            "SACF, i.e. work with δP = P − <P>. The FDT-correct convention. "
+            "Off by default (matches the hGK reference); turn on if the "
+            "verbose diagnostic reports channel means significantly above "
+            "sampling noise."
         ),
     )
     _add_common_output_args(p_acf, default_prefix="")
@@ -1790,6 +1911,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 output_prefix=args.output_prefix,
                 dt_override_ps=args.dt_override_ps,
+                subtract_mean=args.subtract_mean,
                 plot=args.plot,
                 plot_points=args.plot_points,
                 plot_format=args.plot_format,
@@ -1809,6 +1931,7 @@ def main(argv: list[str] | None = None) -> int:
                 plot_format=args.plot_format,
                 verbose=args.verbose,
                 dt_override_ps=args.dt_override_ps,
+                subtract_mean=args.subtract_mean,
             )
         elif args.command == "average":
             run_hgk_avg(

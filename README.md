@@ -185,6 +185,7 @@ gmx-gk-autocorr energy.xvg conf.gro
 | `energy.xvg` | GROMACS `gmx energy` output. Required columns in order: time, Temperature, Pressure, Pres-XX, Pres-XY, Pres-XZ, Pres-YX, Pres-YY, Pres-YZ, Pres-ZX, Pres-ZY, Pres-ZZ. |
 | `conf.gro` | GROMACS structure file. Only the last line (cubic box edge, nm) is read. |
 | `--dt PS` | Per-frame time step in ps (default `0.002`). The time array is rebuilt as `arange(N) * dt` and the xvg's first column is ignored. Pass the value matching the integration step of your MD setup. |
+| `--subtract-mean` | *(optional)* compute the ACF on `δP = P − ⟨P⟩` instead of the raw signal. Off by default to match the original C++ tool. Turn on if the verbose diagnostic reports channel means well above sampling noise. |
 
 Outputs:
 
@@ -209,6 +210,7 @@ gmx-gk-autocorr acf XVG [XVG ...] [options]
 | `--temperature T` | Temperature in K (auto-detected when the .xvg has a Temperature column). |
 | `--log-points N` | Log-spaced sample size for the output (default 10000). |
 | `--dt PS` | Per-frame time step in ps (default `0.002`). Applied uniformly to all input xvgs. The time array is rebuilt as `arange(N) * dt` and the xvg's first column is ignored. |
+| `--subtract-mean` | *(optional)* compute the unbiased SACF on `δP = P − ⟨P⟩` instead of the raw signal. Off by default to match the hGK reference; turn on if the verbose diagnostic warns about channel means. |
 
 With one input the outputs go into `-o` directly. With multiple inputs each
 trajectory is processed into its own subdirectory of `-o`, auto-named after
@@ -482,6 +484,22 @@ after the first step.
 > dataset. This is intentionally an explicit user input: reading the
 > xvg's time column was the source of the previous "50k points labelled
 > as ps" bug.
+
+> **Note on `--subtract-mean` (gk / acf only).** By default the
+> autocorrelation is computed on the raw pressure-tensor signal — this
+> matches the original C++ gmx_gk_autocorr and the hGK reference Python
+> scripts, and relies on the theoretical identity ⟨P_αβ⟩\_eq = 0 for
+> off-diagonal stress. On finite trajectories with a non-zero sample
+> mean μ, the integrated Green-Kubo viscosity picks up a
+> μ²·V·t/(k_B·T) bias that grows **linearly** with the integration
+> window. Pass `--subtract-mean` (or use `-v` to see the per-channel
+> means and a warning when they look suspicious) to switch to the
+> fluctuation form δP = P − ⟨P⟩, which is what the
+> fluctuation-dissipation theorem actually prescribes and which removes
+> the bias. On the bundled `spce_water/` example the default reproduces
+> the hGK paper's η = 0.6637 mPa·s exactly; `--subtract-mean` gives
+> 0.4168 mPa·s. Differences > ~10 % between the two are a sign that the
+> bias matters for your data.
 
 
 ## Example data
