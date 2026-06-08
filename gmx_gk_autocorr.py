@@ -1611,12 +1611,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="GROMACS .gro structure file (only the last line, cubic box edge in nm, is read).",
     )
     p_gk.add_argument(
-        "--dt", dest="dt_override_ps", type=float, default=None,
+        "--dt", dest="dt_override_ps", type=float, default=0.002,
         help=(
-            "Override the time axis: real per-frame step in ps. Use this "
-            "when the xvg's first column is frame indices (or in the wrong "
-            "units) — the time array is then rebuilt as arange(N) * dt and "
-            "the column is ignored."
+            "Per-frame time step in ps used to (re)build the time axis "
+            "(default: 0.002). The time array is computed as arange(N) * dt "
+            "and the input xvg's first column is ignored. Pass the value "
+            "matching the integration step of your MD setup."
         ),
     )
     _add_common_output_args(p_gk, default_prefix="")
@@ -1656,12 +1656,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approximate number of log-spaced points in the output (default: 10000).",
     )
     p_acf.add_argument(
-        "--dt", dest="dt_override_ps", type=float, default=None,
+        "--dt", dest="dt_override_ps", type=float, default=0.002,
         help=(
-            "Override the time axis: real per-frame step in ps. Use this "
-            "when the xvg's first column is frame indices (or in the wrong "
-            "units) — the time array is then rebuilt as arange(N) * dt and "
-            "the column is ignored."
+            "Per-frame time step in ps used to (re)build the time axis "
+            "(default: 0.002). The time array is computed as arange(N) * dt "
+            "and the input xvg's first column is ignored. Pass the value "
+            "matching the integration step of your MD setup."
         ),
     )
     _add_common_output_args(p_acf, default_prefix="")
