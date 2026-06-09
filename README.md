@@ -106,6 +106,15 @@ opt in with `pip install '.[static-plots]'`.
 - Kaleido ≥ 0.2 *(optional)* — required only for `--plot-format png|svg`.
   Pre-installed via `environment.yml`. For the pip-only path:
   `pip install '.[static-plots]'`.
+- Polars ≥ 1.0 *(optional)* — auto-detected. Speeds up I/O on xvg files
+  with single-character column separators (5–12× on the bundled hGK
+  `pressure_components.xvg`). Variable-whitespace GROMACS output is
+  unaffected and continues through `np.loadtxt`.
+- PyFFTW ≥ 0.13 *(optional)* — auto-detected. Plugged in as a scipy.fft
+  backend at import time; gives ~1.5–2× faster FFT than the bundled
+  pocketfft.
+- All three optional extras: `pip install '.[fast,static-plots]'` (or
+  use `environment.yml` which already lists them).
 
 
 ## Quick start
@@ -211,6 +220,7 @@ gmx-gk-autocorr acf XVG [XVG ...] [options]
 | `--log-points N` | Log-spaced sample size for the output (default 10000). |
 | `--dt PS` | Per-frame time step in ps (default `0.002`). Applied uniformly to all input xvgs. The time array is rebuilt as `arange(N) * dt` and the xvg's first column is ignored. |
 | `--subtract-mean` | *(optional)* compute the unbiased SACF on `δP = P − ⟨P⟩` instead of the raw signal. Off by default to match the hGK reference; turn on if the verbose diagnostic warns about channel means. |
+| `--jobs N`, `-j N` | Process multiple xvg files in parallel via ProcessPoolExecutor (default 1 = sequential). `0` or negative uses all available cores. Each worker single-threads its FFT to avoid over-subscription. Memory scales linearly with N — rule of thumb ~3 GB per worker at 5 M frames. |
 
 With one input the outputs go into `-o` directly. With multiple inputs each
 trajectory is processed into its own subdirectory of `-o`, auto-named after

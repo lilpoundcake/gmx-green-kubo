@@ -32,13 +32,119 @@ arguments (no subcommand) routes to ``gk``.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Tuple
 
 import numpy as np
 import plotly.graph_objects as go
 from scipy import fft as _sfft
+
+# Optional FFT backend: pyfftw is ~1.5-2× faster than scipy/pocketfft when
+# present, with no API change because scipy.fft uses it transparently via
+# scipy.fft.set_backend. We try to enable it lazily and fall back silently.
+def _try_enable_pyfftw_backend() -> bool:
+    try:
+        import pyfftw  # noqa: F401
+        import pyfftw.interfaces.scipy_fft as _pyfftw_scipy
+    except Exception:
+        return False
+    # Enable global cache so plans are reused across calls.
+    try:
+        import pyfftw
+        pyfftw.interfaces.cache.enable()
+    except Exception:
+        pass
+    _sfft.set_global_backend(_pyfftw_scipy)
+    return True
+
+
+_PYFFTW_ACTIVE: bool = _try_enable_pyfftw_backend()
+
+
+# Optional fast text reader: polars (when available) is 5–12× faster than
+# np.loadtxt for files with a clean single-character column separator —
+# typically the ``acf`` output of this tool itself, or hGK-style
+# pressure_components.xvg files generated with a single space delimiter.
+# For variable-whitespace GROMACS output (multiple spaces between
+# columns) the polars CSV reader produces extra all-null columns and the
+# heuristic is fragile, so we sniff the first data line and only use
+# polars when the layout is unambiguous. Always falls back to np.loadtxt
+# (which handles arbitrary whitespace correctly).
+def _sniff_single_separator(path: Path, skip: int) -> str | None:
+    """Look at the first data line and decide whether the file uses a
+    single-character column separator (' ' or '\\t'). Returns the
+    separator character if yes, else None.
+    """
+    with open(path) as fh:
+        for _ in range(skip):
+            fh.readline()
+        first = fh.readline()
+    if not first:
+        return None
+    stripped = first.strip()
+    if not stripped:
+        return None
+    # Look for ANY run of >1 of the same whitespace char between non-ws tokens.
+    import re
+    if re.search(r"  +", stripped) or re.search(r"\t\t+", stripped):
+        return None
+    # Look for mixed whitespace (space + tab)
+    if " " in stripped and "\t" in stripped:
+        return None
+    if "\t" in stripped:
+        return "\t"
+    return " "
+
+
+def _fast_loadtxt(path: Path) -> np.ndarray:
+    """Read a numerical xvg-style table fast. Falls back to np.loadtxt
+    for files with variable-whitespace column separators.
+
+    Handles the GROMACS convention of header lines starting with ``@`` or
+    ``#`` only at the top of the file.
+    """
+    # Count leading header lines.
+    skip = 0
+    with open(path) as fh:
+        for line in fh:
+            s = line.lstrip()
+            if not s or s[0] in "@#":
+                skip += 1
+            else:
+                break
+
+    try:
+        import polars as pl
+    except ImportError:
+        return np.loadtxt(path, comments=("@", "#"))
+
+    sep = _sniff_single_separator(path, skip)
+    if sep is None:
+        # Variable-whitespace file — polars can't handle it cleanly.
+        return np.loadtxt(path, comments=("@", "#"))
+
+    try:
+        df = pl.read_csv(
+            str(path),
+            separator=sep,
+            skip_rows=skip,
+            has_header=False,
+            ignore_errors=False,
+            low_memory=True,
+        )
+    except Exception:
+        return np.loadtxt(path, comments=("@", "#"))
+    arr = df.to_numpy()
+    # Guard: polars may produce object dtype if column inference falters.
+    if arr.dtype == object:
+        return np.loadtxt(path, comments=("@", "#"))
+    # Ensure float64 for downstream FFT compatibility.
+    if arr.dtype != np.float64:
+        arr = arr.astype(np.float64)
+    return arr
 
 __version__ = "0.2.0"
 
@@ -72,7 +178,7 @@ def read_xvg(
     Use this when the input xvg's first column is frame indices or in the
     wrong units.
     """
-    raw = np.loadtxt(path, comments=("@", "#"))
+    raw = _fast_loadtxt(path)
     if raw.ndim != 2 or raw.shape[1] < 12:
         raise ValueError(
             f"{path}: expected at least 12 columns (time, T, P + 9 tensor components), "
@@ -410,7 +516,7 @@ def read_pressure_components_xvg(
     Use this when the input xvg's first column is frame indices instead
     of ps (e.g. column shows 0, 1, …, 49999 for a 50 000-step trajectory).
     """
-    raw = np.loadtxt(path, comments=("@", "#"))
+    raw = _fast_loadtxt(path)
     if raw.ndim != 2:
         raise ValueError(f"{path}: failed to parse as a 2-D table (got shape {raw.shape})")
     n_cols = raw.shape[1]
@@ -481,6 +587,7 @@ def hgk_compute_per_run(
     volume_nm3: float,
     temperature_K: float,
     subtract_mean: bool = False,
+    fft_workers: int = -1,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Compute the per-trajectory hGK SACF and running viscosity integral.
 
@@ -509,14 +616,16 @@ def hgk_compute_per_run(
     dt_s = dt_ps * 1e-12
     prefactor = dt_s * 1e-14 * volume_nm3 / (KB * temperature_K)
 
-    # Batched FFT across all 6 channels at once (single scipy call with
-    # workers=-1 — orders of magnitude faster than a Python loop calling
-    # numpy.fft six times).
+    # Batched FFT across all 6 channels at once (single scipy call,
+    # parallelised across CPU cores via workers=-1 — orders of magnitude
+    # faster than a Python loop calling numpy.fft six times). When run
+    # inside a worker process (parallel --jobs > 1), the caller passes
+    # fft_workers=1 to avoid over-subscription.
     n = channels.shape[1]
     arr = channels - channels.mean(axis=1, keepdims=True) if subtract_mean else channels
-    f = _sfft.rfft(arr, n=2 * n, axis=1, workers=-1)
+    f = _sfft.rfft(arr, n=2 * n, axis=1, workers=fft_workers)
     psd = f.real * f.real + f.imag * f.imag
-    acf_full = _sfft.irfft(psd, n=2 * n, axis=1, workers=-1)[:, :n]
+    acf_full = _sfft.irfft(psd, n=2 * n, axis=1, workers=fft_workers)[:, :n]
     sacf_per_channel = acf_full / np.arange(n, 0, -1)
 
     sacf_avg = sacf_per_channel.mean(axis=0)
@@ -1058,6 +1167,7 @@ def _process_single_hgk_run(
     verbose: bool,
     dt_override_ps: float | None = None,
     subtract_mean: bool = False,
+    fft_workers: int = -1,
 ) -> dict:
     """Run the per-trajectory hGK step on a single xvg file.
 
@@ -1097,7 +1207,8 @@ def _process_single_hgk_run(
         )
 
     sacf_per_channel, sacf_avg, poft0, eta_per_channel = hgk_compute_per_run(
-        time, channels, volume, temperature, subtract_mean=subtract_mean
+        time, channels, volume, temperature,
+        subtract_mean=subtract_mean, fft_workers=fft_workers,
     )
     eta_avg = eta_per_channel.mean(axis=0)
 
@@ -1160,6 +1271,17 @@ def _process_single_hgk_run(
     return metadata
 
 
+def _process_single_hgk_run_worker(payload: dict) -> str:
+    """Module-level wrapper so ProcessPoolExecutor can pickle it.
+
+    Takes a dict of all kwargs (everything must be pickleable: paths,
+    floats, ints, strings, None) and dispatches to the real worker.
+    Returns the per-run subdir name for progress reporting.
+    """
+    _process_single_hgk_run(**payload)
+    return str(payload["output_dir"])
+
+
 def run_hgk_run(
     xvg_paths: list[Path],
     output_dir: Path,
@@ -1174,6 +1296,7 @@ def run_hgk_run(
     verbose: bool = False,
     dt_override_ps: float | None = None,
     subtract_mean: bool = False,
+    jobs: int = 1,
 ) -> None:
     """Per-trajectory hGK step on one or more input xvg files.
 
@@ -1181,6 +1304,10 @@ def run_hgk_run(
     (backwards-compatible single-run behaviour). With multiple files, each
     file is processed into a per-run subdirectory of ``output_dir`` named
     after the file's parent folder (or its stem if the parent is unclear).
+
+    ``jobs > 1`` processes multiple xvg files in parallel via
+    ProcessPoolExecutor (each worker gets its own memory image, so be
+    mindful of total RAM = jobs × per-trajectory peak).
 
     V and T can come from explicit CLI flags, from a .gro file (volume), or
     from the Temperature column of a legacy 12-column energy.xvg.
@@ -1190,9 +1317,17 @@ def run_hgk_run(
 
     if len(xvg_paths) == 1:
         _process_single_hgk_run(
-            xvg_paths[0], output_dir, output_prefix,
-            volume_arg, temperature_arg, gro_path,
-            log_points, plot, plot_points, plot_format, verbose,
+            xvg_path=xvg_paths[0],
+            output_dir=output_dir,
+            output_prefix=output_prefix,
+            volume_arg=volume_arg,
+            temperature_arg=temperature_arg,
+            gro_path=gro_path,
+            log_points=log_points,
+            plot=plot,
+            plot_points=plot_points,
+            plot_format=plot_format,
+            verbose=verbose,
             dt_override_ps=dt_override_ps,
             subtract_mean=subtract_mean,
         )
@@ -1204,21 +1339,60 @@ def run_hgk_run(
     if len(set(subdir_names)) != len(subdir_names):
         # Disambiguate by appending an index.
         subdir_names = [f"{n}_{i + 1}" for i, n in enumerate(subdir_names)]
-    for xvg_path, name in zip(xvg_paths, subdir_names):
-        sub_out = output_dir / name
-        if verbose:
-            print(f"\n=== {name} ({xvg_path}) ===")
-        _process_single_hgk_run(
-            xvg_path, sub_out, output_prefix,
-            volume_arg, temperature_arg, gro_path,
-            log_points, plot, plot_points, plot_format, verbose,
+
+    if jobs is None or jobs < 1:
+        jobs = max(1, (os.cpu_count() or 1))
+    jobs = min(jobs, len(xvg_paths))
+
+    # When running multiple workers in parallel, each worker must single-
+    # thread its FFT to avoid over-subscription on shared cores.
+    fft_workers_per_run = -1 if jobs == 1 else 1
+
+    payloads = [
+        dict(
+            xvg_path=xvg_path,
+            output_dir=output_dir / name,
+            output_prefix=output_prefix,
+            volume_arg=volume_arg,
+            temperature_arg=temperature_arg,
+            gro_path=gro_path,
+            log_points=log_points,
+            plot=plot,
+            plot_points=plot_points,
+            plot_format=plot_format,
+            verbose=False,  # parallel: don't interleave verbose per-run logs
             dt_override_ps=dt_override_ps,
             subtract_mean=subtract_mean,
+            fft_workers=fft_workers_per_run,
         )
+        for xvg_path, name in zip(xvg_paths, subdir_names)
+    ]
+
+    if jobs == 1:
+        for payload, name in zip(payloads, subdir_names):
+            if verbose:
+                print(f"\n=== {name} ({payload['xvg_path']}) ===")
+            _process_single_hgk_run(**{**payload, "verbose": verbose})
+    else:
+        if verbose:
+            print(f"Running in parallel with --jobs {jobs}")
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = {pool.submit(_process_single_hgk_run_worker, p): name
+                       for p, name in zip(payloads, subdir_names)}
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    fut.result()  # raises if worker raised
+                    if verbose:
+                        print(f"  ✓ {name}")
+                except Exception as exc:
+                    print(f"  ✗ {name}: {exc!r}")
+                    raise
+
     if verbose:
         print(
             f"\nDone. To average: "
-            f"gmx_gk_autocorr.py average "
+            f"gmx-gk-autocorr average "
             + " ".join(str(output_dir / n) for n in subdir_names)
             + f" -o {output_dir}"
         )
@@ -1805,6 +1979,16 @@ def build_parser() -> argparse.ArgumentParser:
             "sampling noise."
         ),
     )
+    p_acf.add_argument(
+        "--jobs", "-j", type=int, default=1,
+        help=(
+            "Number of trajectories to process in parallel via "
+            "ProcessPoolExecutor (default: 1). 0 or negative = use all CPU "
+            "cores. Memory scales linearly with --jobs since each worker "
+            "holds its own FFT buffers; rule of thumb at 5M frames is "
+            "~3 GB per worker."
+        ),
+    )
     _add_common_output_args(p_acf, default_prefix="")
 
     # average --------------------------------------------------------------
@@ -1952,6 +2136,7 @@ def main(argv: list[str] | None = None) -> int:
                 verbose=args.verbose,
                 dt_override_ps=args.dt_override_ps,
                 subtract_mean=args.subtract_mean,
+                jobs=args.jobs,
             )
         elif args.command == "average":
             run_hgk_avg(

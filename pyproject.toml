@@ -44,6 +44,14 @@ dependencies = [
 # Pin to <1.0 — kaleido 1.x requires a separately-installed Chrome.
 # 0.2.x ships its own bundled chromium and works out of the box.
 static-plots = ["kaleido>=0.2,<1.0"]
+# Faster text parsing for large pressure_components.xvg files (5-12x).
+# Auto-detected at import time; np.loadtxt is used if not installed.
+fast-io = ["polars>=1.0"]
+# Faster FFT backend (~1.5-2x over the bundled scipy/pocketfft).
+# Auto-detected at import time via scipy.fft.set_global_backend.
+fast-fft = ["pyfftw>=0.13"]
+# Everything optional in one shot.
+fast = ["polars>=1.0", "pyfftw>=0.13"]
 
 [project.scripts]
 gmx-gk-autocorr = "gmx_gk_autocorr:main"

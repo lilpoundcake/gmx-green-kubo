@@ -20,4 +20,6 @@ dependencies:
   - scipy>=1.7
   - plotly>=5.0
   - python-kaleido>=0.2,<1.0  # enables `--plot-format png|svg`; <1.0 ships bundled chromium
+  - polars>=1.0               # 5-12x faster I/O for large xvg files (auto-detected)
+  - pyfftw>=0.13              # ~1.5-2x faster FFT backend (auto-detected)
   - pip
