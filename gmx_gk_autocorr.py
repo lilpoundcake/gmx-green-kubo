@@ -64,6 +64,34 @@ def _try_enable_pyfftw_backend() -> bool:
 _PYFFTW_ACTIVE: bool = _try_enable_pyfftw_backend()
 
 
+def _available_memory_gb() -> float:
+    """Best-effort estimate of currently-available system RAM, in GiB.
+
+    Reads /proc/meminfo (MemAvailable, Linux) and falls back to 8 GiB if
+    that's not parseable. Used by hgk_compute_per_run to pick between the
+    fast batched FFT and a per-channel fallback before the OS OOM-kills
+    the process.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    kb = float(line.split()[1])
+                    return kb / 2**20
+    except (OSError, ValueError, IndexError):
+        pass
+    # Fallback if /proc/meminfo not available (macOS, Windows).
+    try:
+        import resource
+        # ulimit -m is rarely set; this is best-effort only.
+        soft, _ = resource.getrlimit(resource.RLIMIT_AS)
+        if soft > 0:
+            return soft / 2**30
+    except Exception:
+        pass
+    return 8.0
+
+
 # Optional fast text reader: polars (when available) is 5–12× faster than
 # np.loadtxt for files with a clean single-character column separator —
 # typically the ``acf`` output of this tool itself, or hGK-style
@@ -666,22 +694,48 @@ def hgk_compute_per_run(
     dt_s = dt_ps * 1e-12
     prefactor = dt_s * 1e-14 * volume_nm3 / (KB * temperature_K)
 
-    # Batched FFT across all 6 channels at once.
+    # FFT across all 6 channels.
     n = channels.shape[1]
-    # Estimate peak RAM: input (6×n × 8 B) + rfft output (6×(n+1) × 16 B
-    # complex) + irfft output (6×2n × 8 B). Roughly 6 × n × 40 B ≈ 240 n B.
-    est_gb = 240 * n / 2**30
-    if est_gb > 16:
+    # Estimate peak RAM for the BATCHED path: input (6×n × 8 B) + rfft
+    # output (6×(n+1) × 16 B complex) + irfft output (6×2n × 8 B)
+    # ≈ 6 × n × 40 B. Compare to the system's available memory and pick
+    # the per-channel sequential path when the batched form would risk
+    # the OOM killer.
+    bytes_per_channel = 40 * n  # peak per channel for batched
+    batched_gb = 6 * bytes_per_channel / 2**30
+    avail_gb = _available_memory_gb()
+    # Per-channel path peaks at ~1 channel-worth of buffers = bytes_per_channel.
+    # Use a 60 %-of-available rule of thumb to leave room for the OS and
+    # other processes; below that we batch, above we go sequential.
+    use_batched = batched_gb < 0.6 * avail_gb
+    arr_in = channels - channels.mean(axis=1, keepdims=True) if subtract_mean else channels
+
+    if use_batched:
+        f = _sfft.rfft(arr_in, n=2 * n, axis=1, workers=fft_workers)
+        psd = f.real * f.real + f.imag * f.imag
+        del f
+        acf_full = _sfft.irfft(psd, n=2 * n, axis=1, workers=fft_workers)[:, :n]
+        del psd
+    else:
+        # Per-channel sequential — ~6× less memory than the batched form
+        # at modest (~30 %) speed cost. Triggered automatically when the
+        # batched buffers would exceed 60 % of available RAM (e.g. for
+        # N ≳ 5e7 frames on a 32 GB machine).
+        per_ch_gb = bytes_per_channel / 2**30
         print(
-            f"  Warning: batched FFT for N = {n} will need ~{est_gb:.1f} "
-            f"GB of RAM. If this OOMs, run `acf` with --jobs 1 on smaller "
-            f"trajectory pieces, or split your input."
+            f"  Note: batched FFT would need ~{batched_gb:.1f} GB "
+            f"(available ≈ {avail_gb:.1f} GB) — falling back to "
+            f"per-channel FFT (~{per_ch_gb:.1f} GB peak) to avoid OOM."
         )
-    arr = channels - channels.mean(axis=1, keepdims=True) if subtract_mean else channels
-    f = _sfft.rfft(arr, n=2 * n, axis=1, workers=fft_workers)
-    psd = f.real * f.real + f.imag * f.imag
-    acf_full = _sfft.irfft(psd, n=2 * n, axis=1, workers=fft_workers)[:, :n]
+        acf_full = np.empty_like(arr_in)
+        for ch in range(arr_in.shape[0]):
+            xf = _sfft.rfft(arr_in[ch], n=2 * n, workers=fft_workers)
+            psd_1d = xf.real * xf.real + xf.imag * xf.imag
+            del xf
+            acf_full[ch] = _sfft.irfft(psd_1d, n=2 * n, workers=fft_workers)[:n]
+            del psd_1d
     sacf_per_channel_full = acf_full / np.arange(n, 0, -1)
+    del acf_full
 
     # Truncate the noisy tail (unbiased estimator divides by 1/(N-k) → huge
     # variance as k → N). Keep the first M = floor(N · max_lag_fraction)
@@ -2352,7 +2406,17 @@ def main(argv: list[str] | None = None) -> int:
         else:
             parser.error(f"unknown subcommand {args.command!r}")
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
-        parser.exit(2, f"error: {exc}\n")
+        # Make errors prominent — emit a clear banner plus the message
+        # so they don't get visually buried after a long --verbose log.
+        msg = str(exc)
+        bar = "=" * (max(40, min(76, len(msg) + 8)))
+        sys.stderr.write(
+            f"\n{bar}\n"
+            f"ERROR: {msg}\n"
+            f"{bar}\n"
+            f"No output files were written.\n"
+        )
+        return 2
     return 0
 
 
