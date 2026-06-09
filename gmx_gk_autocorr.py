@@ -1137,7 +1137,16 @@ def run_gk(
     factor = volume * 1e-26 / (KB * temperature_avg) * dt
 
     if verbose:
-        print(f"Integrating Green-Kubo running integral up to t = {half_len * dt} ps")
+        traj_len_ps = N * dt
+        print(
+            f"Integrating Green-Kubo running integral up to t = "
+            f"{half_len * dt:.4g} ps (= N/2·dt, half the {traj_len_ps:.4g} ps "
+            f"trajectory). The circular-ACF method caps at N/2 to avoid the "
+            f"wrap-around bias at longer lags; a liquid's SACF decays in "
+            f"≲10 ps so the running η has long converged before this cap. "
+            f"For longer-lag analysis use the `acf` subcommand instead "
+            f"(unbiased linear ACF, integrates to max_lag_fraction·N)."
+        )
     viscosity = green_kubo_running_integral(autocorr, factor, half_len)
 
     output_dir.mkdir(parents=True, exist_ok=True)
