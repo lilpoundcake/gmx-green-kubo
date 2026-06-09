@@ -1073,6 +1073,7 @@ def run_gk(
     output_prefix: str,
     dt_override_ps: float | None = None,
     subtract_mean: bool = False,
+    max_lag_fraction: float = 0.5,
     plot: bool = True,
     plot_points: int = 1500,
     plot_format: str = "html",
@@ -1133,21 +1134,38 @@ def run_gk(
     psd = (X.real * X.real + X.imag * X.imag) / N
     autocorr = _sfft.irfft(psd, n=N, axis=1, workers=-1)
 
-    half_len = N // 2
+    # The circular-ACF method must stop at N/2 to avoid wrap-around bias;
+    # the user can stop EARLIER via --max-lag-fraction (any value > 0.5
+    # is clamped to 0.5). For long trajectories, capping at e.g. 0.005
+    # (T/200) keeps the integration in the SACF-decay region and out of
+    # the post-decay random-walk noise that drives running η negative.
+    max_lag_fraction = float(np.clip(max_lag_fraction, 0.001, 0.5))
+    half_len = max(2, int(N * max_lag_fraction))
     factor = volume * 1e-26 / (KB * temperature_avg) * dt
 
     if verbose:
         traj_len_ps = N * dt
         print(
             f"Integrating Green-Kubo running integral up to t = "
-            f"{half_len * dt:.4g} ps (= N/2·dt, half the {traj_len_ps:.4g} ps "
-            f"trajectory). The circular-ACF method caps at N/2 to avoid the "
-            f"wrap-around bias at longer lags; a liquid's SACF decays in "
-            f"≲10 ps so the running η has long converged before this cap. "
-            f"For longer-lag analysis use the `acf` subcommand instead "
-            f"(unbiased linear ACF, integrates to max_lag_fraction·N)."
+            f"{half_len * dt:.4g} ps "
+            f"(--max-lag-fraction × N · dt; trajectory length {traj_len_ps:.4g} ps). "
+            f"The circular-ACF method can't go past N/2 (wrap-around bias). "
+            f"Stopping earlier — past where the SACF has decayed — keeps "
+            f"the cumulative-integral noise out of the result."
         )
     viscosity = green_kubo_running_integral(autocorr, factor, half_len)
+    # Verbose "plateau" estimate: the running η peaks where the SACF
+    # first decays to zero — that peak is typically a much better
+    # estimate of the converged viscosity than the value at the cap.
+    if verbose:
+        eta_avg_t = viscosity[-1]  # channel-averaged running η
+        i_peak = int(np.argmax(eta_avg_t))
+        t_peak = (i_peak + 1) * dt
+        print(
+            f"Running η peak: {eta_avg_t[i_peak]:.4f} mPa·s at t = {t_peak:.4g} ps. "
+            f"(For converged data this is the best single estimate. "
+            f"Open viscosity.html for the full curve and visual plateau.)"
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     acf_path = output_dir / f"{output_prefix}acf.dat"
@@ -2048,6 +2066,19 @@ def build_parser() -> argparse.ArgumentParser:
             "channel means significantly above sampling noise."
         ),
     )
+    p_gk.add_argument(
+        "--max-lag-fraction", type=float, default=0.5,
+        help=(
+            "Stop the running Green-Kubo integral at this fraction of the "
+            "trajectory length (default 0.5 = N/2, the hard upper bound of "
+            "the circular-ACF method). For long trajectories the SACF has "
+            "decayed long before t=N/2·dt and integrating further just "
+            "accumulates noise (which can drive η negative when "
+            "--subtract-mean is on). Try smaller values like 0.001-0.01 on "
+            "multi-ns trajectories to keep the integral near the SACF "
+            "decay region."
+        ),
+    )
     _add_common_output_args(p_gk, default_prefix="")
 
     # acf ------------------------------------------------------------------
@@ -2241,6 +2272,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_prefix=args.output_prefix,
                 dt_override_ps=args.dt_override_ps,
                 subtract_mean=args.subtract_mean,
+                max_lag_fraction=args.max_lag_fraction,
                 plot=args.plot,
                 plot_points=args.plot_points,
                 plot_format=args.plot_format,

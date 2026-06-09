@@ -193,17 +193,35 @@ gmx-gk-autocorr energy.xvg conf.gro
 |---|---|
 | `energy.xvg` | GROMACS `gmx energy` output. Required columns in order: time, Temperature, Pressure, Pres-XX, Pres-XY, Pres-XZ, Pres-YX, Pres-YY, Pres-YZ, Pres-ZX, Pres-ZY, Pres-ZZ. |
 | `conf.gro` | GROMACS structure file. Only the last line (cubic box edge, nm) is read. |
-| `--dt PS` | Per-frame time step in ps (default `0.002`). The time array is rebuilt as `arange(N) * dt` and the xvg's first column is ignored. Pass the value matching the integration step of your MD setup. |
-| `--subtract-mean` | *(optional)* compute the ACF on `δP = P − ⟨P⟩` instead of the raw signal. Off by default to match the original C++ tool. Turn on if the verbose diagnostic reports channel means well above sampling noise. |
+| `--dt PS` | *(optional)* override the per-frame time step in ps. When set, the time array is rebuilt as `arange(N) * dt` and the xvg's first column is ignored. Use this only when the xvg's time column is broken (frame indices, wrong units). |
+| `--subtract-mean` | *(optional)* compute the ACF on `δP = P − ⟨P⟩` instead of the raw signal. Off by default to match the original C++ tool. Turn on if the verbose diagnostic reports `bias/signal > 0.1` for any channel. |
+| `--max-lag-fraction F` | Stop the running integral at fraction F of the trajectory length (default 0.5 = N/2, the hard upper bound of the circular-ACF method). For long trajectories (≫100 ps) the SACF has decayed long before N/2 and integrating further just integrates noise. Try `0.001–0.01` on multi-ns trajectories to keep the integral near the SACF-decay region. |
 
 Outputs:
 
 | File | Contents |
 |---|---|
-| `acf.dat` | Time (ps), 6 channel ACFs, average — units bar². |
+| `acf.dat` | Time (ps), 6 channel ACFs, average — units bar². Row 0 is t=0 (the lag-0 value, C(0)). |
 | `viscosity.dat` | Time (ps), 6 channel Green-Kubo integrals, average — units mPa·s. |
 | `metadata.dat` | Average volume (nm³) and temperature (K). |
 | `acf.html`, `viscosity.html` | Interactive Plotly plots. |
+
+> **Reading `viscosity.dat` for long trajectories.** The viscosity is
+> the **plateau** of the running η(t) curve, not the value at the last
+> row. After the SACF decays (typically ≲10 ps for water-like liquids)
+> the running integral is a random walk around the plateau — it can
+> drift positive or negative, especially with `--subtract-mean`. The
+> tool prints the **peak value of η(t) and its time** in verbose mode
+> (`-v`) as a single-number estimate; open `viscosity.html` for the
+> full curve.
+>
+> For multi-ns trajectories you should pass `--max-lag-fraction` to
+> stop the integration in the SACF-decay region instead of letting it
+> walk through ns of noise. Rule of thumb: `--max-lag-fraction
+> (100 ps / T_trajectory)` — e.g. on a 100 ns trajectory pass
+> `--max-lag-fraction 0.001`. Alternatively use the `acf` →
+> `average` → `scan` → `fit` pipeline, which fits and analytically
+> extrapolates the tail instead of just integrating it.
 
 ### `acf` — per-trajectory hGK step
 
@@ -505,6 +523,37 @@ After this, the bias is gone:
 - the residual scatter at long times is real statistical noise that
   needs more trajectories or the hGK pipeline's tail extrapolation
   (`scan` + `fit`)
+
+### Watch out: negative running viscosity on long trajectories
+
+After the bias is removed, the SACF is the autocorrelation of pure
+fluctuations and decays to zero at long lag. Past the decay (typically
+≲ 10 ps), every additional lag contributes pure noise around zero, and
+the cumulative integral becomes a **random walk** — it can drift to
+negative values purely from noise accumulation, with no physical
+meaning.
+
+On a 100 ns trajectory with `gk --subtract-mean`, the default integration
+caps at N/2 ≈ 50 ns — that's ~50 000 ps of noise after a ~10 ps SACF
+decay. The last row of `viscosity.dat` (at t = 50 ns) is essentially
+that random walk's endpoint, *not* the viscosity.
+
+**The viscosity is the plateau value**, not the cap value. Two fixes:
+
+1. **Cap the integration earlier** with `--max-lag-fraction`:
+
+   ```bash
+   # On a 100 ns trajectory: cap at 100 ps (= 0.1% of trajectory)
+   gmx-gk-autocorr gk md.xvg md.gro --subtract-mean --max-lag-fraction 0.001 -v
+   ```
+
+   `-v` will then print the `Running η peak: <value> at t = <t> ps`
+   line, which is your viscosity estimate.
+
+2. **Use the hybrid pipeline** (`acf` → `average` → `scan` → `fit`)
+   which fits a stretched exponential to the SACF tail and integrates
+   the fit analytically to a chosen `τ_cut`. This is the right
+   workflow for any multi-ns trajectory.
 
 ### Why it's not the default
 
