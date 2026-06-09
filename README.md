@@ -516,13 +516,15 @@ Two reasons:
    the default identical preserves byte-for-byte reproducibility of
    both:
    - `gk` on `example_files/` ≡ C++ `SELFvisco.xvg` (`max abs diff = 0`)
-   - `acf+average+fit` on `spce_water/` ≡ hGK paper η = 0.6637 mPa·s
+   - `acf+average+fit` on `spce_water/` ≈ 0.6585 mPa·s (was 0.6637 before
+     the noisy-tail truncation and trapezoidal integration fixes; same
+     ~0.66 mPa·s ballpark as the hGK paper)
 2. **Short-trajectory bias trade-off.** On truly-zero-mean
    well-equilibrated data, subtracting the noisy sample mean removes a
    small amount of real signal (the low-frequency Fourier component
    contaminated by sampling noise). For the bundled `spce_water/`
    example (10 ps × 5 runs), the FDT-correct flag drops η from
-   0.6637 → 0.4168 mPa·s, the difference being mostly this
+   0.6585 → 0.4115 mPa·s, the difference being mostly this
    short-trajectory artifact rather than the bias.
 
 The right workflow is therefore: **run without the flag first**,
@@ -656,7 +658,7 @@ gmx-gk-autocorr scan spce_out/acf_mean.dat spce_out/viscosity_mean.dat \
     --tau-low 0.2 -v
 gmx-gk-autocorr fit spce_out/acf_mean.dat spce_out/viscosity_mean.dat \
     --tau-low 0.2 --tau-up 5 --tau-cut 5000 -v
-# → Final viscosity at τ_cut = 5000.0 ps: 0.6637 mPa·s
+# → Final viscosity at τ_cut = 5000.0 ps: 0.6585 mPa·s
 ```
 
 

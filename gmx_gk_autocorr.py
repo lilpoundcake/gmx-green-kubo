@@ -73,30 +73,35 @@ _PYFFTW_ACTIVE: bool = _try_enable_pyfftw_backend()
 # heuristic is fragile, so we sniff the first data line and only use
 # polars when the layout is unambiguous. Always falls back to np.loadtxt
 # (which handles arbitrary whitespace correctly).
-def _sniff_single_separator(path: Path, skip: int) -> str | None:
-    """Look at the first data line and decide whether the file uses a
-    single-character column separator (' ' or '\\t'). Returns the
-    separator character if yes, else None.
+def _sniff_single_separator(path: Path, skip: int, lines_to_check: int = 16) -> str | None:
+    """Look at the first ``lines_to_check`` data lines and decide whether
+    the file uses a single-character column separator (' ' or '\\t').
+    Returns the separator if every sampled line agrees, else None.
+
+    Sampling more than one line guards against files whose column widths
+    change mid-file (e.g. a sign flip turning '12.3 45.6' into
+    '12.3 -45.6' which a strict per-line splitter would mis-parse).
     """
+    import re
+    multi_ws = re.compile(r"  +|\t\t+")
+    seps_seen: set[str | None] = set()
     with open(path) as fh:
         for _ in range(skip):
             fh.readline()
-        first = fh.readline()
-    if not first:
+        for _ in range(lines_to_check):
+            line = fh.readline()
+            if not line:
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if multi_ws.search(stripped) or (" " in stripped and "\t" in stripped):
+                seps_seen.add(None)
+                break
+            seps_seen.add("\t" if "\t" in stripped else " ")
+    if not seps_seen or None in seps_seen or len(seps_seen) > 1:
         return None
-    stripped = first.strip()
-    if not stripped:
-        return None
-    # Look for ANY run of >1 of the same whitespace char between non-ws tokens.
-    import re
-    if re.search(r"  +", stripped) or re.search(r"\t\t+", stripped):
-        return None
-    # Look for mixed whitespace (space + tab)
-    if " " in stripped and "\t" in stripped:
-        return None
-    if "\t" in stripped:
-        return "\t"
-    return " "
+    return next(iter(seps_seen))
 
 
 def _fast_loadtxt(path: Path) -> np.ndarray:
@@ -245,38 +250,69 @@ def _check_sample_mean(
     subtract_mean: bool,
     verbose: bool,
 ) -> None:
-    """Print per-channel sample means and warn about systematic bias.
+    """Print per-channel sample means and rough bias-vs-signal estimate.
 
-    Each off-diagonal channel of the pressure tensor has ``<P_αβ>_eq = 0``
-    in theory, so a finite-sample mean larger than ``3 * σ/√N`` (where σ
-    is the sample standard deviation and N is the trajectory length) is
-    a sign that either the signal isn't equilibrated or the data has a
-    real systematic stress. Either way, the integrated Green-Kubo
-    viscosity picks up a ``μ²·V·t/(kB·T)`` linear-in-t bias that is *not*
-    physical viscosity. ``--subtract-mean`` removes it.
+    Each off-diagonal channel has ``<P_αβ>_eq = 0`` theoretically, but
+    on finite-sample MD the running mean is non-zero by sampling noise
+    plus any real systematic stress. The leading-order bias on the
+    integrated viscosity is ``μ²·V·t/(kB·T)``; the only safe per-channel
+    diagnostic is to compare this bias to the magnitude of the
+    fluctuation autocorrelation ``σ²·τ_c`` (where τ_c is the integrated
+    autocorrelation time).
+
+    We don't know τ_c without computing the ACF, so we use a cheap
+    proxy: lag-1 autocorrelation `ρ₁` gives an *order-of-magnitude*
+    estimate of `τ_c ≈ (1+ρ₁)/(1-ρ₁) · dt`. The "effective N" for the
+    std-of-mean is then `N_eff = N / (2·τ_c/dt)`. This is loose but
+    enough to suppress the false positives that a naïve iid estimator
+    fires on every clean autocorrelated trajectory.
+
+    Behaviour:
+      - verbose: print mean, std, autocorrelation-aware SEM, and ratio.
+      - WARNING only when `|mean| > 10 × SEM_corr` AND the diagnosed
+        bias term `μ²·N·dt` is more than ~10 % of the signal term
+        `σ²·τ_c` (rough but conservative).
     """
     means = channels.mean(axis=1)
     stds = channels.std(axis=1)
-    N = channels.shape[1]
-    sem = stds / np.sqrt(N)  # naive std-of-mean (treats samples as iid)
-    z = np.abs(means) / np.maximum(sem, 1e-30)
+    n = channels.shape[1]
+    # Lag-1 autocorrelation, robust to constant channels.
+    ac1 = np.empty_like(means)
+    for i, ch in enumerate(channels):
+        v = stds[i]
+        if v <= 0:
+            ac1[i] = 0.0
+            continue
+        a = (ch[:-1] - means[i]) * (ch[1:] - means[i])
+        ac1[i] = a.mean() / (v * v)
+    # Effective autocorrelation time in samples, clamped.
+    ac1 = np.clip(ac1, 0.0, 0.999)
+    tau_int = (1.0 + ac1) / (1.0 - ac1)
+    n_eff = np.maximum(n / (2.0 * tau_int), 2.0)
+    sem_eff = stds / np.sqrt(n_eff)
+    z = np.abs(means) / np.maximum(sem_eff, 1e-30)
+    # Rough bias-to-signal ratio: bias = μ²·V·T_total; signal ~ σ²·τ_c·V
+    # (both share the same V/(kBT) prefactor, so they cancel). Ratio is
+    # μ²·n / (σ²·τ_int). Flag only when bias > 10 % of signal.
+    bias_to_signal = (means * means * n) / np.maximum(stds * stds * tau_int, 1e-30)
     if verbose:
-        print("Per-channel sample means (bar):")
-        for name, m, s, e, zi in zip(names, means, stds, sem, z):
+        print("Per-channel sample mean diagnostic (bar):")
+        print(f"  (τ_int estimated from lag-1 ACF; "
+              f"SEM ≈ σ/√(N/(2·τ_int)); rough heuristic)")
+        for name, m, s, e, zi, b2s in zip(names, means, stds, sem_eff, z, bias_to_signal):
             print(
-                f"  {name:>4}: mean = {m:+9.4f}  std = {s:8.2f}  "
-                f"std-of-mean ≈ {e:7.4f}  |mean|/sem ≈ {zi:6.1f}"
+                f"  {name:>6}: mean = {m:+9.4f}  σ = {s:8.2f}  "
+                f"SEM_corr ≈ {e:7.4f}  |mean|/SEM ≈ {zi:6.1f}  "
+                f"bias/signal ≈ {b2s:7.2g}"
             )
-    suspicious = (z > 3) & (np.abs(means) > 1e-3)
+    suspicious = (z > 10) & (bias_to_signal > 0.1)
     if suspicious.any() and not subtract_mean:
-        bad = ", ".join(n for n, b in zip(names, suspicious) if b)
+        bad = ", ".join(n_ for n_, b in zip(names, suspicious) if b)
         print(
-            f"WARNING: channels {{{bad}}} have sample means well above "
-            f"sampling noise. The Green-Kubo integral picks up a "
-            f"μ²·V·t/(kB·T) bias from each. Re-run with --subtract-mean "
-            f"to use the fluctuation form δP = P − <P> (the FDT-correct "
-            f"convention). Without it, the result tracks the bias, not "
-            f"the physical viscosity."
+            f"WARNING: channels {{{bad}}} have a sample-mean-induced "
+            f"bias estimated at >10 % of the signal. The Green-Kubo "
+            f"integral picks up a μ²·V·t/(kB·T) bias term. Consider "
+            f"--subtract-mean (FDT-correct convention)."
         )
 
 
@@ -352,8 +388,14 @@ def write_autocorr(path: Path, dt: float, autocorr: np.ndarray, half_len: int) -
     """Write the classical-GK ACF table.
 
     8 columns: time(ps), 6 symmetrised-channel ACFs (bar²), channel-average.
+
+    Note: prior versions (preserving a historical C++-port off-by-one)
+    labelled the t=0 lag value as t=dt. Fixed here — row i now carries
+    the time label ``i*dt`` and the ACF value at lag i, so row 0 has
+    t=0 and C(0). This is no longer bit-equivalent to the original
+    C++ reference's time column, only to its value column.
     """
-    times = (np.arange(half_len) + 1) * dt
+    times = np.arange(half_len) * dt
     channels = autocorr[:, :half_len]
     average = channels.mean(axis=0, keepdims=True)
     data = np.column_stack([times, channels.T, average.T])
@@ -588,6 +630,7 @@ def hgk_compute_per_run(
     temperature_K: float,
     subtract_mean: bool = False,
     fft_workers: int = -1,
+    max_lag_fraction: float = 0.8,
 ) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
     """Compute the per-trajectory hGK SACF and running viscosity integral.
 
@@ -596,19 +639,26 @@ def hgk_compute_per_run(
     time : (N,) array in ps (uniform spacing assumed).
     channels : (6, N) off-diagonal pressure tensor components in bar.
     volume_nm3, temperature_K : ensemble V and T.
+    max_lag_fraction : truncate the unbiased ACF (and the running η
+        integral) at this fraction of the trajectory length. Default
+        0.8 suppresses the well-known noise blow-up of the
+        ``1/(N-k)``-divided unbiased estimator near k=N, while leaving
+        enough range for the typical fit window. Without truncation the
+        running viscosity is dominated by integrated noise at long lags
+        (and can drift to negative values when ``subtract_mean=True``).
 
     Returns
     -------
-    sacf_per_channel : (6, N) unbiased ACF in bar^2 for each off-diagonal channel.
-    sacf_avg : (N,) channel-averaged ACF in bar^2.
-    poft0 : float — value of sacf_avg at zero lag (i.e. C(0) in bar^2).
-    eta_per_channel : (6, N) running Green-Kubo integral per channel (mPa·s).
-        Note: integration is a left Riemann sum (cumsum * dt * prefactor) to
-        match the hGK reference implementation; for large N the trapezoidal
-        correction is negligible relative to noise.
+    sacf_per_channel : (6, M) unbiased ACF in bar², M = N·max_lag_fraction.
+    sacf_avg : (M,) channel-averaged ACF in bar².
+    poft0 : C(0) in bar² (the lag-0 value of sacf_avg).
+    eta_per_channel : (6, M) running Green-Kubo integral per channel (mPa·s).
+        Trapezoidal rule, matching the classical-``gk`` path so the two
+        algorithms differ only in the choice of ACF estimator and channel
+        set, not in the integration method.
 
-    The prefactor used is dt(s) * 1e-14 * V(nm^3) / (kB * T) so that the
-    resulting integral is in mPa·s when SACF is in bar^2 and dt is in s.
+    Prefactor: ``dt[s] · 1e-14 · V[nm³] / (kB · T[K])`` so that the
+    integral comes out in mPa·s with SACF in bar² and dt in s.
     """
     if time.size < 4:
         raise ValueError(f"Need at least 4 frames, got {time.size}")
@@ -616,29 +666,53 @@ def hgk_compute_per_run(
     dt_s = dt_ps * 1e-12
     prefactor = dt_s * 1e-14 * volume_nm3 / (KB * temperature_K)
 
-    # Batched FFT across all 6 channels at once (single scipy call,
-    # parallelised across CPU cores via workers=-1 — orders of magnitude
-    # faster than a Python loop calling numpy.fft six times). When run
-    # inside a worker process (parallel --jobs > 1), the caller passes
-    # fft_workers=1 to avoid over-subscription.
+    # Batched FFT across all 6 channels at once.
     n = channels.shape[1]
+    # Estimate peak RAM: input (6×n × 8 B) + rfft output (6×(n+1) × 16 B
+    # complex) + irfft output (6×2n × 8 B). Roughly 6 × n × 40 B ≈ 240 n B.
+    est_gb = 240 * n / 2**30
+    if est_gb > 16:
+        print(
+            f"  Warning: batched FFT for N = {n} will need ~{est_gb:.1f} "
+            f"GB of RAM. If this OOMs, run `acf` with --jobs 1 on smaller "
+            f"trajectory pieces, or split your input."
+        )
     arr = channels - channels.mean(axis=1, keepdims=True) if subtract_mean else channels
     f = _sfft.rfft(arr, n=2 * n, axis=1, workers=fft_workers)
     psd = f.real * f.real + f.imag * f.imag
     acf_full = _sfft.irfft(psd, n=2 * n, axis=1, workers=fft_workers)[:, :n]
-    sacf_per_channel = acf_full / np.arange(n, 0, -1)
+    sacf_per_channel_full = acf_full / np.arange(n, 0, -1)
+
+    # Truncate the noisy tail (unbiased estimator divides by 1/(N-k) → huge
+    # variance as k → N). Keep the first M = floor(N · max_lag_fraction)
+    # samples. M < 2 would be silly so clamp.
+    max_lag_fraction = float(np.clip(max_lag_fraction, 0.05, 1.0))
+    m = max(2, int(n * max_lag_fraction))
+    sacf_per_channel = sacf_per_channel_full[:, :m]
 
     sacf_avg = sacf_per_channel.mean(axis=0)
     poft0 = float(sacf_avg[0])
-    eta_per_channel = prefactor * np.cumsum(sacf_per_channel, axis=1)
+
+    # Trapezoidal integration (matches the classical-gk path).
+    # eta[k] = prefactor · ( ½·C[0] + C[1] + … + C[k-1] + ½·C[k] )
+    # = prefactor · ( cumsum(C) − ½·(C[0] + C[k]) )
+    csum = np.cumsum(sacf_per_channel, axis=1)
+    eta_per_channel = prefactor * (
+        csum - 0.5 * (sacf_per_channel[:, :1] + sacf_per_channel)
+    )
     return sacf_per_channel, sacf_avg, poft0, eta_per_channel
 
 
 def log_subsample_indices(n: int, num: int = 10000) -> np.ndarray:
-    """Indices for a log-spaced subsample of size up to ``num`` from a length-n array."""
+    """Indices for a log-spaced subsample of size up to ``num`` from a length-n array.
+
+    Always includes index 0 (the lag-0 sample / C(0) point), which a naïve
+    ``np.logspace(0, …)`` would skip because 10**0 = 1.
+    """
     if n <= 1:
         return np.array([0]) if n == 1 else np.array([], dtype=int)
-    return np.unique(np.logspace(0, np.log10(n - 1), num=num, dtype=int))
+    log_idx = np.logspace(0, np.log10(n - 1), num=num, dtype=int)
+    return np.unique(np.concatenate([[0], log_idx]))
 
 
 def _linear_subsample_indices(n: int, num: int) -> np.ndarray:
@@ -681,11 +755,20 @@ def format_hgk_metadata(meta: dict) -> str:
     """Serialise an hGK metadata dict into a single comment line.
 
     Example output:
-        # hGK_metadata: volume_nm3=121.734 temperature_K=303.0 timeperframe_ps=0.001 p0_bar2=33375.834 n_runs=1
+        # hGK_metadata: volume_nm3=121.734 temperature_K=303.0 timeperframe_ps=0.001 p0_bar2=33375.834 n_runs=1 source=pressure_components.xvg
+
+    String values are written verbatim (xvg paths shouldn't contain
+    whitespace); the metadata parser splits on whitespace so any value
+    containing a space would silently truncate.
     """
-    pairs = " ".join(f"{k}={v!r}" if isinstance(v, str) else f"{k}={v:.10g}"
-                     for k, v in meta.items())
-    return f"# {HGK_METADATA_TAG} {pairs}"
+    pairs = []
+    for k, v in meta.items():
+        if isinstance(v, str):
+            # Strip any whitespace so the round-trip is well-defined.
+            pairs.append(f"{k}={v.replace(' ', '_')}")
+        else:
+            pairs.append(f"{k}={v:.10g}")
+    return f"# {HGK_METADATA_TAG} " + " ".join(pairs)
 
 
 def parse_hgk_metadata(path: Path) -> dict:
@@ -781,8 +864,8 @@ def hgk_average_runs(
             raise FileNotFoundError(p_path)
         if not e_path.is_file():
             raise FileNotFoundError(e_path)
-        p = np.loadtxt(p_path, comments="#")
-        e = np.loadtxt(e_path, comments="#")
+        p = _fast_loadtxt(p_path)
+        e = _fast_loadtxt(e_path)
         if time is None:
             time = p[:, 0]
         elif p.shape[0] != time.size:
@@ -795,9 +878,11 @@ def hgk_average_runs(
     poft_stack = np.stack(poft_list)  # (n_runs, M, n_cols-1)
     eta_stack = np.stack(eta_list)
     mean_poft = poft_stack.mean(axis=0)
-    std_poft = poft_stack.std(axis=0, ddof=0)
+    # Use ddof=1 (sample std, Bessel-corrected) since n_runs is typically
+    # 3-10 — the population-std form ddof=0 is biased low at small N.
+    std_poft = poft_stack.std(axis=0, ddof=1) if poft_stack.shape[0] > 1 else np.zeros_like(poft_stack[0])
     mean_eta = eta_stack.mean(axis=0)
-    std_eta = eta_stack.std(axis=0, ddof=0)
+    std_eta = eta_stack.std(axis=0, ddof=1) if eta_stack.shape[0] > 1 else np.zeros_like(eta_stack[0])
     return time, mean_poft, std_poft, mean_eta, std_eta
 
 
@@ -959,8 +1044,19 @@ def hgk_final_extrapolation(
     """
     if tau_low_ps >= tau_up_ps:
         raise ValueError("tau_low must be smaller than tau_up")
-    if tau_up_ps > tau[-1]:
-        raise ValueError("tau_up exceeds SACF time range")
+    # Allow tau_up to sit exactly at (or one sample past) the last lag —
+    # rounding from the user's chosen tau_up can land just outside the
+    # truncated SACF range. Strictly past one frame is an error.
+    dtau = float(tau[1] - tau[0]) if tau.size > 1 else 0.0
+    if tau_up_ps > tau[-1] + dtau:
+        raise ValueError(
+            f"tau_up={tau_up_ps} ps exceeds SACF time range "
+            f"({tau[-1]:.4g} ps). The SACF is truncated at "
+            f"max_lag_fraction × trajectory length; try a smaller tau_up "
+            f"or re-run `acf` with --max-lag-fraction larger (e.g. 0.9)."
+        )
+    # Clamp tau_up to the data range so searchsorted doesn't slip off.
+    tau_up_ps = min(tau_up_ps, tau[-1])
     popt, tau_low_id, _ = hgk_fit_tail(tau, sacf_norm, tau_low_ps, tau_up_ps)
 
     prefactor = _hgk_tail_prefactor(fine_dt_ps, volume_nm3, temperature_K)
@@ -1120,7 +1216,7 @@ def _resolve_volume_temperature(
     if temperature is None:
         # Try to recover temperature from the legacy energy.xvg layout.
         try:
-            raw = np.loadtxt(xvg_path, comments=("@", "#"))
+            raw = _fast_loadtxt(xvg_path)
         except Exception:
             raw = None
         if raw is not None and raw.ndim == 2 and raw.shape[1] >= 12:
@@ -1211,6 +1307,10 @@ def _process_single_hgk_run(
         subtract_mean=subtract_mean, fft_workers=fft_workers,
     )
     eta_avg = eta_per_channel.mean(axis=0)
+    # hgk_compute_per_run truncates the noisy long-lag tail; the
+    # returned arrays have length M ≤ time.size. Align the time axis.
+    m = sacf_per_channel.shape[1]
+    time = time[:m]
 
     metadata = {
         "volume_nm3": volume,
@@ -1225,7 +1325,7 @@ def _process_single_hgk_run(
     acf_path = output_dir / f"{output_prefix}acf.dat"
     viscosity_path = output_dir / f"{output_prefix}viscosity.dat"
 
-    indices = log_subsample_indices(time.size, num=log_points)
+    indices = log_subsample_indices(m, num=log_points)
     write_hgk_poft(acf_path, time, sacf_avg, sacf_per_channel, indices, metadata)
     write_hgk_etaoft(viscosity_path, time, eta_per_channel, indices, metadata)
 
@@ -1342,7 +1442,13 @@ def run_hgk_run(
 
     if jobs is None or jobs < 1:
         jobs = max(1, (os.cpu_count() or 1))
+    requested_jobs = jobs
     jobs = min(jobs, len(xvg_paths))
+    if verbose and requested_jobs > jobs:
+        print(
+            f"  --jobs {requested_jobs} requested but only {len(xvg_paths)} "
+            f"input(s); capping to --jobs {jobs}."
+        )
 
     # When running multiple workers in parallel, each worker must single-
     # thread its FFT to avoid over-subscription on shared cores.
@@ -1433,7 +1539,9 @@ def _merge_run_metadata(run_dirs: list[Path], acf_name: str) -> dict:
             merged[key] = first_meta[key]
     if p0_values:
         merged["p0_bar2"] = float(np.mean(p0_values))
-        merged["p0_bar2_std"] = float(np.std(p0_values, ddof=0))
+        merged["p0_bar2_std"] = float(
+            np.std(p0_values, ddof=1) if len(p0_values) > 1 else 0.0
+        )
     merged["n_runs"] = len(run_dirs)
     return merged
 
@@ -1614,6 +1722,12 @@ def _resolve_hgk_fit_params(
     volume = _pick("volume", volume_arg, "volume_nm3")
     temperature = _pick("temperature", temperature_arg, "temperature_K")
     p0 = _pick("p0", p0_arg, "p0_bar2")
+    if p0 <= 0:
+        raise ValueError(
+            f"p0 (C(0) of the SACF) must be positive, got {p0}. "
+            f"Either the metadata is corrupt or the user-supplied --p0 is "
+            f"out of range."
+        )
     return volume, temperature, p0
 
 
@@ -1906,12 +2020,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="GROMACS .gro structure file (only the last line, cubic box edge in nm, is read).",
     )
     p_gk.add_argument(
-        "--dt", dest="dt_override_ps", type=float, default=0.002,
+        "--dt", dest="dt_override_ps", type=float, default=None,
         help=(
-            "Per-frame time step in ps used to (re)build the time axis "
-            "(default: 0.002). The time array is computed as arange(N) * dt "
-            "and the input xvg's first column is ignored. Pass the value "
-            "matching the integration step of your MD setup."
+            "Override the per-frame time step in ps. When set, the time "
+            "array is reconstructed as arange(N) * dt and the input xvg's "
+            "first column is ignored. Use this when the xvg's first column "
+            "is frame indices (or in the wrong units) instead of ps. By "
+            "default, the time column from the xvg is used as-is."
         ),
     )
     p_gk.add_argument(
@@ -1961,12 +2076,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approximate number of log-spaced points in the output (default: 10000).",
     )
     p_acf.add_argument(
-        "--dt", dest="dt_override_ps", type=float, default=0.002,
+        "--dt", dest="dt_override_ps", type=float, default=None,
         help=(
-            "Per-frame time step in ps used to (re)build the time axis "
-            "(default: 0.002). The time array is computed as arange(N) * dt "
-            "and the input xvg's first column is ignored. Pass the value "
-            "matching the integration step of your MD setup."
+            "Override the per-frame time step in ps. When set, the time "
+            "array is reconstructed as arange(N) * dt and the input xvg's "
+            "first column is ignored. Use this when the xvg's first column "
+            "is frame indices (or in the wrong units) instead of ps. By "
+            "default, the time column from the xvg is used as-is."
         ),
     )
     p_acf.add_argument(
